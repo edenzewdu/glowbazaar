@@ -7,8 +7,14 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 # Bot token
-bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-bot = telebot.TeleBot('7980677707:AAHOjt7GRuPsMEaI623OtauJ_XRuWA6V_t8')
+TELEGRAM_BOT_TOKEN = '7980677707:AAHOjt7GRuPsMEaI623OtauJ_XRuWA6V_t8'
+
+# Initialize bot
+if not TELEGRAM_BOT_TOKEN:
+    logging.error("Bot token is missing! Please set the TELEGRAM_BOT_TOKEN variable.")
+    exit(1)
+
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # List of admin user IDs
 admins = [709031839]  # Replace with actual admin IDs
@@ -16,21 +22,28 @@ admins = [709031839]  # Replace with actual admin IDs
 # Dictionary to track product data for each admin
 product_data = {}
 
+# Track ongoing user-admin conversations
+active_chats = {}
+
 # Channel username or ID where product details are posted
 channel_id = "@glowbazaartest"  # Replace with your channel's username or ID
 
+# Ensure the 'photos' directory exists
+if not os.path.exists("photos"):
+    os.makedirs("photos")
+
 # Function to post a product to the channel with markup
-def post_product_to_channel(photo_path, caption, buy_link, description):
+def post_product_to_channel(photo_path, product_name, description):
     try:
-        # Prepare markup with buttons
+        # Prepare markup with a callback button
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("Buy Product", url=buy_link))
+        markup.add(InlineKeyboardButton("Buy Product", callback_data=f"buy_product|{product_name}|{description}"))  # Updated callback
 
         # Send the photo to the channel with the markup
         bot.send_photo(
             chat_id=channel_id,
             photo=open(photo_path, 'rb'),
-            caption=f"{caption}\n\nDescription:\n{description}",
+            caption=f"{product_name}\n\nDescription:\n{description}",
             reply_markup=markup
         )
         logging.info("Product posted successfully!")
@@ -58,97 +71,113 @@ def handle_photo(message):
         new_file.write(downloaded_file)
 
     product_data[message.from_user.id]["photo"] = photo_path
-    bot.send_message(message.chat.id, "Photo received! Now send me the product caption (description).")
+    bot.send_message(message.chat.id, "Photo received! Now send me the product name.")
 
-# Step 2: Handle product caption
-@bot.message_handler(func=lambda message: message.from_user.id in admins and message.from_user.id in product_data and "caption" not in product_data[message.from_user.id])
-def handle_caption(message):
-    product_data[message.from_user.id]["caption"] = message.text
-    bot.send_message(message.chat.id, "Caption received! Now send me the buy link.")
+# Step 2: Handle product name
+@bot.message_handler(func=lambda message: message.from_user.id in admins and message.from_user.id in product_data and "name" not in product_data[message.from_user.id])
+def handle_product_name(message):
+    product_data[message.from_user.id]["name"] = message.text
+    bot.send_message(message.chat.id, "Product name received! Now send me the product description.")
 
-# Step 3: Handle buy link
-@bot.message_handler(func=lambda message: message.from_user.id in admins and message.from_user.id in product_data and "buy_link" not in product_data[message.from_user.id])
-def handle_buy_link(message):
-    product_data[message.from_user.id]["buy_link"] = message.text
+# Step 3: Handle product description (caption)
+@bot.message_handler(func=lambda message: message.from_user.id in admins and message.from_user.id in product_data and "description" not in product_data[message.from_user.id])
+def handle_description(message):
+    product_data[message.from_user.id]["description"] = message.text
+    bot.send_message(message.chat.id, "Description received! Type 'post' to post the product.")
 
-    # Generate description automatically
-    caption = product_data[message.from_user.id]["caption"]
-    product_data[message.from_user.id]["description"] = f"This amazing product is available now! {caption}. Don't miss out on this great deal."
-
-    bot.send_message(message.chat.id, "Buy link received! Do you want to post this product? (yes/no)")
-    product_data[message.from_user.id]["ready"] = True
-
-# Step 4: Handle confirmation to post
-@bot.message_handler(func=lambda message: message.from_user.id in admins and product_data.get(message.from_user.id, {}).get("ready"))
-def handle_post_confirmation(message):
-    if message.text.lower() == "yes":
+# Step 4: Handle posting confirmation
+@bot.message_handler(func=lambda message: message.from_user.id in admins and message.text.lower() == "post")
+def handle_post(message):
+    if message.from_user.id in product_data:
         data = product_data[message.from_user.id]
-
-        # Post the product to the channel
-        post_product_to_channel(data["photo"], data["caption"], data["buy_link"], data["description"])
-
+        post_product_to_channel(data["photo"], data["name"], data["description"])
         bot.send_message(message.chat.id, "Product posted successfully!")
         del product_data[message.from_user.id]  # Clear the admin's data after posting
-    elif message.text.lower() == "no":
-        bot.send_message(message.chat.id, "Product posting canceled.")
-        del product_data[message.from_user.id]  # Clear the admin's data
     else:
-        bot.send_message(message.chat.id, "Please reply with 'yes' or 'no'.")
+        bot.send_message(message.chat.id, "No product data to post.")
 
-# Handle messages from users
-@bot.message_handler(func=lambda message: True)
-def handle_user_message(message):
-    user_id = message.from_user.id
-    user_name = f"{message.from_user.first_name} {message.from_user.last_name or ''}".strip()
+# Step 5: Handle "Buy Product" button click
+@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_product"))
+def handle_buy_product_click(call):
+    try:
+        # Parse the callback data (product name and description)
+        _, product_name, description = call.data.split("|", 2)
+        user_id = call.from_user.id
+        user_name = f"{call.from_user.first_name} {call.from_user.last_name or ''}".strip()
+        user_username = call.from_user.username
 
-    # Notify admins about the new interaction
-    for admin_id in admins:
+        # Send product details to admins (background notification)
+        for admin_id in admins:
+            bot.send_message(
+                admin_id,
+                f"User {user_name} (ID: {user_id}) is interested in the following product:\n\n"
+                f"Product: {product_name}\n\nDescription: {description}\n\n"
+                f"User Info:\nUsername: @{user_username}\nName: {user_name}\nID: {user_id}"
+            )
+
+        # Track the active chat between the user and the admin
+        active_chats[user_id] = {"product": product_name}
+
+        # Send a direct message to the user's inbox confirming the inquiry
         markup = InlineKeyboardMarkup()
-        button = InlineKeyboardButton("Respond to user", callback_data=f"respond_{user_id}")
-        markup.add(button)
+        markup.add(InlineKeyboardButton("Back to Bot", url=f"t.me/{bot.get_me().username}"))  # Redirect to the bot
+
+        # Directly send a message to the user's inbox (personal chat)
         bot.send_message(
-            admin_id,
-            f"New user interaction: {user_name}",
+            user_id,
+            f"Thank you for your interest in {product_name}!\n\n"
+            f"An admin will contact you soon to assist with your inquiry.\n\n"
+            f"Please stay tuned.",
             reply_markup=markup
         )
 
-    # Reply to the user
-    bot.send_message(user_id, "Hello! How can I help you today?")
+        # Optionally, send a follow-up message to the user in their inbox (for example, asking for confirmation)
+        bot.send_message(
+            user_id,
+            f"To proceed with your interest in {product_name}, an admin will get in touch with you shortly."
+        )
+
+    except Exception as e:
+        logging.error(f"Failed to handle 'Buy Product' click: {e}")
 
 
-# Handle admin responses
-@bot.callback_query_handler(func=lambda call: call.data.startswith("respond_"))
-def handle_admin_response(call):
-    user_id = int(call.data.split("_")[1])
-    admin_id = call.from_user.id
+# Function to relay messages from user to admin and vice versa
+@bot.message_handler(func=lambda message: message.from_user.id in active_chats, content_types=["text", "photo", "video", "voice", "audio"])
+def relay_message(message):
+    chat_data = active_chats[message.from_user.id]
 
-    if user_id in active_users:
-        # If another admin is already assisting
-        bot.answer_callback_query(call.id, "This user is already being assisted by another admin.")
+    # Determine whether the message is from the user or admin
+    if message.from_user.id == chat_data.get("user"):
+        recipient_id = chat_data.get("admin")  # Send to admin if the user is sending a message
     else:
-        # Assign the user to the current admin
-        active_users[user_id] = admin_id
-        bot.answer_callback_query(call.id, "You are now assisting this user.")
+        recipient_id = chat_data.get("user")  # Send to user if the admin is responding
 
-        # Notify the admin that they are connected to the user
-        bot.send_message(admin_id, f"You are now assisting the user with ID: {user_id}")
+    if message.content_type == "text":
+        bot.send_message(recipient_id, f"Message from {message.from_user.first_name}:\n\n{message.text}")
+    else:
+        # Relay media message (photo, video, voice, etc.)
+        relay_media_message(message, recipient_id, message.content_type)
 
-
-# Command for admins to stop assistance
-@bot.message_handler(commands=["stop"])
-def stop_assistance(message):
-    admin_id = message.from_user.id
-
-    # Check if the admin is assisting a user
-    for user_id, assisting_admin in list(active_users.items()):
-        if assisting_admin == admin_id:
-            del active_users[user_id]
-            bot.send_message(admin_id, "You have ended the conversation.")
+# Admin responses to users using /respond command
+@bot.message_handler(commands=["respond"])
+def respond_to_user(message):
+    try:
+        # Command format: /respond <user_id> <message>
+        args = message.text.split(maxsplit=2)
+        if len(args) < 3:
+            bot.send_message(message.chat.id, "Usage: /respond <user_id> <message>")
             return
 
-    # If the admin wasn't assisting anyone
-    bot.send_message(admin_id, "You are not assisting any user currently.")
-    
+        user_id = int(args[1])
+        response_message = args[2]
+
+        # Send the response to the user
+        bot.send_message(user_id, f"Admin Response:\n\n{response_message}")
+        bot.send_message(message.chat.id, "Message sent to the user.")
+    except Exception as e:
+        logging.error(f"Failed to send admin response: {e}")
+        bot.send_message(message.chat.id, "An error occurred while sending the message.")
+
 # Start the bot
 if __name__ == "__main__":
     logging.info("Bot is running...")
